@@ -1,4 +1,3 @@
 {
-  "buildCommand": "node scripts/build.mjs",
-  "outputDirectory": "dist/client"
+  "framework": "nextjs"
 }
