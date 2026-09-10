@@ -44,12 +44,15 @@
     document.querySelectorAll('.filter').forEach(b=>b.onclick=()=>{document.querySelectorAll('.filter').forEach(x=>x.classList.remove('active'));b.classList.add('active');render(b.dataset.filter)});document.querySelector('#cartOpen').onclick=()=>document.querySelector('#cartDrawer').classList.add('open');document.querySelector('#cartClose').onclick=()=>document.querySelector('#cartDrawer').classList.remove('open');document.querySelector('#cartCloseBtn').onclick=()=>document.querySelector('#cartDrawer').classList.remove('open');render();
   </script>
   <!--
-    Hero swirl-brush effect: a WebGL fluid/dye simulation (Navier-Stokes style:
+    Hero swirl-brush effect: a WebGL fluid simulation (Navier-Stokes style:
     advection, curl + vorticity confinement for the swirl, pressure projection,
-    splat-on-pointer-move) painted in the hero's own background green. Because
-    the dye colour matches the background, it's invisible over empty space and
-    only reveals a swirling brush stroke where it crosses the bright hero text —
-    same technique family as visiteamazonia.com.br's hero.
+    splat-on-pointer-move) drives a velocity field that's used as a UV
+    displacement map over a texture of the hero heading — so the fluid motion
+    actually tears/smudges the letters apart on hover (not just a colour
+    overlay), matching visiteamazonia.com.br's hero technique. The real <h1>
+    stays in the DOM (transparent) for SEO/accessibility/layout; the canvas
+    draws and distorts a copy of it. A faint dye haze (tinted to the hero's
+    own background colour) shows through the torn gaps.
     To disable: set ENABLE_HERO_FLUID to false below (code stays intact).
   -->
   <script>
@@ -70,12 +73,13 @@
       SIM_RESOLUTION: isSmall ? 96 : 128,
       DYE_RESOLUTION: isSmall ? 384 : 640,
       DENSITY_DISSIPATION: 2.6,
-      VELOCITY_DISSIPATION: 1.3,
+      VELOCITY_DISSIPATION: 3.4,
       PRESSURE: 0.8,
       PRESSURE_ITERATIONS: 16,
-      CURL: 24,
-      SPLAT_RADIUS: 0.0016,
-      SPLAT_FORCE: 4200,
+      CURL: 16,
+      SPLAT_RADIUS: 0.0022,
+      SPLAT_FORCE: 6500,
+      DISTORTION: 0.0014,
       COLOR: [10/255, 51/255, 10/255]
     };
 
@@ -140,7 +144,7 @@
       'precision mediump float;\nprecision mediump sampler2D;\nvarying highp vec2 vUv;\nuniform sampler2D uTexture;\nuniform float value;\nvoid main () {\n  gl_FragColor = value * texture2D(uTexture, vUv);\n}';
 
     var displayShaderSource =
-      'precision highp float;\nprecision highp sampler2D;\nvarying vec2 vUv;\nuniform sampler2D uTexture;\nvoid main () {\n  vec3 c = texture2D(uTexture, vUv).rgb;\n  float a = clamp(max(max(c.r, c.g), c.b) * 1.4, 0.0, 1.0);\n  gl_FragColor = vec4(c, a);\n}';
+      'precision highp float;\nprecision highp sampler2D;\nvarying vec2 vUv;\nuniform sampler2D uDye;\nuniform sampler2D uText;\nuniform sampler2D uVelocity;\nuniform float distortion;\nvoid main () {\n  vec2 vel = texture2D(uVelocity, vUv).xy;\n  vec2 duv = vUv - vel * distortion;\n  vec4 dye = texture2D(uDye, vUv);\n  vec4 txt = texture2D(uText, duv);\n  float dyeAlpha = clamp(max(max(dye.r, dye.g), dye.b) * 1.4, 0.0, 1.0);\n  vec3 color = mix(dye.rgb, txt.rgb, txt.a);\n  float a = max(dyeAlpha * 0.55, txt.a);\n  gl_FragColor = vec4(color, a);\n}';
 
     var splatShaderSource =
       'precision highp float;\nvarying vec2 vUv;\nuniform sampler2D uTarget;\nuniform float aspectRatio;\nuniform vec3 color;\nuniform vec2 point;\nuniform float radius;\nvoid main () {\n  vec2 p = vUv - point.xy;\n  p.x *= aspectRatio;\n  vec3 splat = exp(-dot(p, p) / radius) * color;\n  vec3 base = texture2D(uTarget, vUv).xyz;\n  gl_FragColor = vec4(base + splat, 1.0);\n}';
@@ -203,6 +207,64 @@
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2,0,2,3]), gl.STATIC_DRAW);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(0);
+
+    // --- text-as-texture: the real <h1> is drawn onto an offscreen 2D canvas
+    // (so its glyphs can be resampled/distorted by the fluid velocity field
+    // in the display shader) and hidden in place. Layout, sizing, responsive
+    // breakpoints and accessibility all still come from the real DOM node —
+    // only its paint is swapped for the WebGL-distorted copy.
+    var heroTextEl = heroEl.querySelector('h1');
+    var textTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, textTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    var textCanvas = document.createElement('canvas');
+    var textCanvasSize = {w:0, h:0};
+    function buildTextTexture(){
+      if (!heroTextEl) return;
+      var heroRect = heroEl.getBoundingClientRect();
+      var textRect = heroTextEl.getBoundingClientRect();
+      if (!heroRect.width || !heroRect.height) return;
+      var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      var w = Math.max(1, Math.round(heroRect.width * dpr));
+      var h = Math.max(1, Math.round(heroRect.height * dpr));
+      textCanvas.width = w;
+      textCanvas.height = h;
+      textCanvasSize.w = w;
+      textCanvasSize.h = h;
+      var tctx = textCanvas.getContext('2d');
+      tctx.clearRect(0, 0, w, h);
+      var cs = getComputedStyle(heroTextEl);
+      var fontSize = parseFloat(cs.fontSize) * dpr;
+      var lineHeight = parseFloat(cs.lineHeight);
+      if (!lineHeight || isNaN(lineHeight)) lineHeight = fontSize * 0.9;
+      else lineHeight *= dpr;
+      tctx.font = (cs.fontWeight || '900') + ' ' + fontSize + 'px ' + cs.fontFamily;
+      tctx.fillStyle = heroTextColor;
+      tctx.textAlign = 'center';
+      tctx.textBaseline = 'middle';
+      if ('letterSpacing' in tctx) { try { tctx.letterSpacing = cs.letterSpacing; } catch(e){} }
+      var upper = cs.textTransform === 'uppercase';
+      var lines = (heroTextEl.innerText || heroTextEl.textContent || '').split('\n');
+      var originX = (textRect.left - heroRect.left + textRect.width / 2) * dpr;
+      var startY = (textRect.top - heroRect.top) * dpr + lineHeight / 2;
+      for (var i=0;i<lines.length;i++){
+        var line = upper ? lines[i].toUpperCase() : lines[i];
+        tctx.fillText(line, originX, startY + lineHeight * i);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, textTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+    }
+
+    var heroTextColor = '#ffee00';
+    if (heroTextEl) {
+      var computedColor = getComputedStyle(heroTextEl).color;
+      if (computedColor && computedColor !== 'rgba(0, 0, 0, 0)') heroTextColor = computedColor;
+      heroTextEl.style.color = 'transparent';
+    }
 
     function blit(target){
       if (target == null) {
@@ -379,7 +441,12 @@
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
       gl.useProgram(displayProgram.program);
-      gl.uniform1i(displayProgram.uniforms.uTexture, dye.read.attach(0));
+      gl.uniform1i(displayProgram.uniforms.uDye, dye.read.attach(0));
+      gl.uniform1i(displayProgram.uniforms.uText, 1);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, textTexture);
+      gl.uniform1i(displayProgram.uniforms.uVelocity, velocity.read.attach(2));
+      gl.uniform1f(displayProgram.uniforms.distortion, config.DISTORTION);
       blit(null);
     }
 
@@ -389,7 +456,7 @@
       var now = Date.now();
       var dt = Math.min((now - lastTime) / 1000, 0.02);
       lastTime = now;
-      if (resizeCanvas()) initFramebuffers();
+      if (resizeCanvas()) { initFramebuffers(); buildTextTexture(); }
       if (pointer.moved) { splatFromPointer(pointer); pointer.moved = false; }
       step(dt);
       renderToScreen();
@@ -400,6 +467,8 @@
 
     resizeCanvas();
     initFramebuffers();
+    buildTextTexture();
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(buildTextTexture);
 
     if ('IntersectionObserver' in window) {
       var io = new IntersectionObserver(function(entries){
